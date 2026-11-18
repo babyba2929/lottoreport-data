@@ -1,0 +1,133 @@
+# 매주 당첨 결과 자동 갱신 + GitHub Pages 배포
+#
+# - schedule·workflow_dispatch: 검사(check.mjs) → 갱신(update.mjs) → 바뀐 파일 커밋·push → 배포
+# - push(main): 배포만
+#
+# update.mjs 종료 코드
+#   0 정상 / 1 받기·검사 실패 → 커밋·배포 없이 실패
+#   2 원본 갱신 지연 → 바뀐 파일은 커밋·배포하고 맨 마지막(stale-alert)에 실패 (알림용)
+#
+# GITHUB_TOKEN으로 push한 커밋은 다른 실행을 깨우지 않으므로, 같은 실행 안에서 새 커밋 기준으로 배포한다.
+
+name: 갱신·배포
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    # UTC 기준
+    - cron: "17 13 * * 6" # 토 22:17 KST
+    - cron: "17 0 * * 0" # 일 09:17 KST
+    - cron: "17 0 * * 1" # 월 09:17 KST
+
+# 기본은 권한 없음. 필요한 job에만 준다.
+permissions: {}
+
+# 한 번에 하나만 실행 (진행 중인 실행은 취소하지 않음)
+concurrency:
+  group: lottoreport-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: 갱신
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      exit_code: ${{ steps.update.outputs.exit_code }}
+      stale_message: ${{ steps.update.outputs.stale_message }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: 검사 (scripts/check.mjs)
+        run: node scripts/check.mjs
+
+      - name: 원본 받아 갱신 (scripts/update.mjs)
+        id: update
+        run: |
+          code=0
+          node scripts/update.mjs > "$RUNNER_TEMP/update.log" 2>&1 || code=$?
+          cat "$RUNNER_TEMP/update.log"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            msg=$(grep '원본 갱신 지연' "$RUNNER_TEMP/update.log" | tail -n 1)
+            echo "stale_message=$msg" >> "$GITHUB_OUTPUT"
+            echo "::warning::$msg (바뀐 파일은 커밋·배포하고 마지막에 실패로 끝내요)"
+          elif [ "$code" -ne 0 ]; then
+            echo "::error::update.mjs 실패 (종료 코드 $code). 커밋·배포하지 않아요."
+            exit "$code"
+          fi
+
+      - name: 바뀐 파일 커밋·push
+        id: commit
+        run: |
+          git add v1/all.json v1/recent.json
+          if git diff --cached --quiet; then
+            echo "바뀐 파일 없음"
+          else
+            latest=$(node -e 'const r = JSON.parse(require("fs").readFileSync("v1/all.json", "utf8")); console.log(r[r.length - 1].draw_no)')
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "data: ${latest}회 반영"
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: 배포
+    needs: update
+    # 갱신이 성공했을 때(지연 포함), 또는 push(main)일 때(갱신 job은 건너뜀)
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+      (needs.update.result == 'success' || (github.event_name == 'push' && needs.update.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # 갱신한 경우 방금 push한 커밋, push(main)이면 그 커밋
+          ref: ${{ needs.update.outputs.sha || github.sha }}
+
+      - name: v1/ 폴더만 모으기
+        run: |
+          mkdir -p _site
+          cp -R v1 _site/v1
+          ls -l _site/v1
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: GitHub Pages 배포
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  stale-alert:
+    name: 원본 갱신 지연 알림
+    needs: [update, deploy]
+    if: ${{ !cancelled() && needs.update.outputs.exit_code == '2' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 실패로 끝내기
+        env:
+          STALE_MESSAGE: ${{ needs.update.outputs.stale_message }}
+        run: |
+          echo "::error::${STALE_MESSAGE:-원본 갱신 지연}"
+          exit 1
